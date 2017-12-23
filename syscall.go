@@ -18,6 +18,7 @@ package main
 
 import (
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"syscall"
@@ -178,7 +179,54 @@ func waitForBlockDevice(deviceName string) error {
 	return nil
 }
 
-func mountContainerRootFs(containerID, image, rootFs, fsType string) (string, error) {
+func scanSCSIBus() error {
+	scsiHostPath := "/sys/class/scsi_host"
+	if _, err := os.Stat(scsiHostPath); err != nil {
+		return err
+	}
+
+	files, err := ioutil.ReadDir(scsiHostPath)
+	if err != nil {
+		return err
+	}
+
+	// Rescan scsi host passing in wildcards for the channel, SCSI id and LUN.
+	scanData := []byte("- - -")
+
+	for _, file := range files {
+		host := file.Name()
+		scanPath := filepath.Join(scsiHostPath, host, "scan")
+		if err := ioutil.WriteFile(scanPath, scanData, 0666); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// findSCSIDisk finds the SCSI disk name associated with the given SCSI address
+// This approach eliminates the need to predict the disk name on the host side,
+// but we do need to rescan SCSI bus for this.
+func findSCSIDisk(scsiAddr string) (string, error) {
+	scsiPath := fmt.Sprintf("/sys/class/scsi_disk/0:0:%s/device/block", scsiAddr)
+
+	if _, err := os.Stat(scsiPath); err != nil {
+		return "", err
+	}
+
+	files, err := ioutil.ReadDir(scsiPath)
+	if err != nil {
+		return "", err
+	}
+
+	if len(files) > 1 {
+		return "", fmt.Errorf("Expecting a single SCSI device, found %v", files)
+	}
+
+	return files[0].Name(), nil
+}
+
+func mountContainerRootFs(containerID, image, rootFs, fsType, scsiAddr string) (string, error) {
 	dest := filepath.Join(containerMountDest, containerID, "root")
 	if err := os.MkdirAll(dest, os.FileMode(0755)); err != nil {
 		return "", err
@@ -186,9 +234,23 @@ func mountContainerRootFs(containerID, image, rootFs, fsType string) (string, er
 
 	var source string
 	if fsType != "" {
-		source = filepath.Join(devPath, image)
-		if err := waitForBlockDevice(image); err != nil {
-			return "", err
+		// If SCSI adddress is provided, use that to find SCSI disk
+		if scsiAddr != "" {
+			if err := scanSCSIBus(); err != nil {
+				return "", err
+			}
+
+			scsiDiskName, err := findSCSIDisk(scsiAddr)
+			if err != nil {
+				return "", err
+			}
+
+			source = filepath.Join(devPath, scsiDiskName)
+		} else {
+			source = filepath.Join(devPath, image)
+			if err := waitForBlockDevice(image); err != nil {
+				return "", err
+			}
 		}
 
 		if err := mount(source, dest, fsType, 0); err != nil {
