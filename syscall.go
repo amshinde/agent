@@ -20,7 +20,9 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -116,10 +118,14 @@ func unmountShareDir() error {
 	return os.RemoveAll(containerMountDest)
 }
 
-func waitForBlockDevice(deviceName string) error {
+func waitForBlockDevice(deviceName string, isSCSI bool) error {
 	devicePath := filepath.Join(devPath, deviceName)
 
-	if _, err := os.Stat(devicePath); err == nil {
+	if isSCSI {
+		if _, err := os.Stat("/sys/class/scsi_device/0:0:0:0"); err == nil {
+			return nil
+		}
+	} else if _, err := os.Stat(devicePath); err == nil {
 		return nil
 	}
 
@@ -155,11 +161,15 @@ func waitForBlockDevice(deviceName string) error {
 			for d := range ch {
 				fieldLogger = fieldLogger.WithFields(logrus.Fields{
 					"udev-path":  d.Syspath(),
+					"dev-path":   d.Devpath(),
 					"udev-event": d.Action(),
 				})
 
 				fieldLogger.Info("got udev event")
-				if d.Action() == "add" && filepath.Base(d.Devpath()) == deviceName {
+				if isSCSI && d.Action() == "add" && strings.Contains(d.Devpath(), deviceName) {
+					fieldLogger.Info("Hotplug event received")
+					break
+				} else if d.Action() == "add" && filepath.Base(d.Devpath()) == deviceName {
 					fieldLogger.Info("Hotplug event received")
 					break
 				}
@@ -171,7 +181,7 @@ func waitForBlockDevice(deviceName string) error {
 	select {
 	case <-doneListening:
 		close(done)
-	case <-time.After(time.Duration(1) * time.Second):
+	case <-time.After(time.Duration(3) * time.Second):
 		close(done)
 		return fmt.Errorf("Timed out waiting for device %s", deviceName)
 	}
@@ -191,7 +201,7 @@ func scanSCSIBus() error {
 	}
 
 	// Rescan scsi host passing in wildcards for the channel, SCSI id and LUN.
-	scanData := []byte("- - -")
+	scanData := []byte("0 0 0")
 
 	for _, file := range files {
 		host := file.Name()
@@ -236,19 +246,40 @@ func mountContainerRootFs(containerID, image, rootFs, fsType, scsiAddr string) (
 	if fsType != "" {
 		// If SCSI adddress is provided, use that to find SCSI disk
 		if scsiAddr != "" {
+			agentLog.Infof("***SCSI address provided %s", scsiAddr)
 			if err := scanSCSIBus(); err != nil {
+				return "", err
+			}
+
+			if err := waitForBlockDevice("0:"+scsiAddr+"/block", true); err != nil {
 				return "", err
 			}
 
 			scsiDiskName, err := findSCSIDisk(scsiAddr)
 			if err != nil {
+				cmd := exec.Command("ls", "-la", "/sys/class/scsi_disk/")
+				stdoutStderr, err := cmd.CombinedOutput()
+				if err != nil {
+					//log.Fatal(err)
+					return "", err
+				}
+				agentLog.Infof("ls /sys/class/scsi_disk output %s\n", stdoutStderr)
+
+				cmd = exec.Command("lsblk")
+				stdoutStderr, err = cmd.CombinedOutput()
+				if err != nil {
+					return "", err
+					//log.Fatal(err)
+				}
+				agentLog.Infof("lsblk output %s\n", stdoutStderr)
+
 				return "", err
 			}
 
 			source = filepath.Join(devPath, scsiDiskName)
 		} else {
 			source = filepath.Join(devPath, image)
-			if err := waitForBlockDevice(image); err != nil {
+			if err := waitForBlockDevice(image, false); err != nil {
 				return "", err
 			}
 		}
